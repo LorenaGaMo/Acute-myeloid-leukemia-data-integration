@@ -1,0 +1,179 @@
+---
+title: "Split_script"
+author: "Lorena"
+date: " "
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(plyr)
+library(dplyr)
+library(caret)
+
+```
+
+
+```{r}
+#prepare directory
+setwd(".")
+ROOT <- "."
+# TCGA data directory
+DATADIR <- file.path(ROOT, "Data")
+# ACGT data dir (for clinical info)
+ACGTDIR <- file.path(ROOT, "original")
+# output directory
+OUTROOT <- DATADIR
+
+```
+
+
+```{r}
+tumor <- "AML"
+
+read_tcga <- function(datafile, sample_col="ID", suffix="01") {
+    df <- as.data.frame(read_delim(datafile, " ", progress=FALSE)) %>% 
+        tibble::column_to_rownames(sample_col) %>%
+        dplyr::select(ends_with(suffix))
+    # variance filter
+    vars <- apply(df, 1, IQR)
+    quant <- quantile(vars, probs=0.5)
+    selected <- !is.na(vars) & vars > quant
+    as.data.frame(t(df[selected, ])) %>% tibble::rownames_to_column(var="Sample")
+}
+```
+
+
+```{r}
+# list of ID suffixes to keep (tumor-dependent)
+suffixes <- list()
+suffixes[["AML"]] <- "03"
+
+
+samples <- read.delim2("./original/clinical/aml", header = TRUE, sep = "\t")
+expr <- read_tcga(file.path(ACGTDIR, str_to_lower(tumor), "exp"), suffix=suffixes[[tumor]])
+meth <- read_tcga(file.path(ACGTDIR, str_to_lower(tumor), "methy"), suffix=suffixes[[tumor]])
+mirna <- read_tcga(file.path(ACGTDIR, str_to_lower(tumor), "mirna"), suffix=suffixes[[tumor]])
+
+samples <- samples %>% setNames(paste0("clin:", names(.))) %>% 
+    dplyr::rename(Sample=`clin:sampleID`)
+```
+```{r}
+# throw away columns with all NAs
+samples <- samples[, colSums(is.na(samples)) != nrow(samples)]
+samples <- samples[grepl(sprintf("%s$", suffixes[[tumor]]), samples$Sample), ]
+samples$Sample <- gsub("-", ".", samples$Sample)
+
+expr <- expr %>% setNames(paste0("gene:", names(.))) %>% 
+    dplyr::rename(Sample=`gene:Sample`)
+
+meth <- meth %>% setNames(paste0("meth:", names(.))) %>% 
+    dplyr::rename(Sample=`meth:Sample`)
+
+mirna <- mirna %>% setNames(paste0("mirna:", names(.))) %>% 
+    dplyr::rename(Sample=`mirna:Sample`)
+```
+```{r}
+#save data
+write_csv(expr, "./original/aml/expCl.txt")
+write_tsv(meth, "./original/aml/methCl.txt")
+write_tsv(mirna, "./original/aml/mirnaCl.txt")
+
+```
+
+
+```{r}
+# get common samples
+omics <- list(expr=expr$Sample, meth=meth$Sample, mirna=mirna$Sample)
+sampleIntersect <- Reduce(intersect, omics)
+samples <- samples[samples$Sample %in% sampleIntersect, ]
+
+# join all dataframes
+mrg <- join_all(list(samples, expr, meth, mirna), by="Sample", type="left")
+# remove near-zero variance features
+nzv <- nearZeroVar(mrg, saveMetrics=TRUE, foreach=TRUE)
+mrg <- mrg[, !nzv$nzv]
+
+# save
+write_tsv(mrg, file.path(OUTROOT, tumor, "merged.txt"))
+```
+
+```{r}
+# select
+
+tgt <- "clin:X_OS_IND"
+mrg.sub <- mrg[!is.na(mrg[, tgt]), ]
+y <- factor(mrg.sub[, tgt])
+mrg.sub <- dplyr::select(mrg.sub, -`tgt`)
+table(y) # 0 = alive, 1 = deceased
+```
+
+```{r}
+colMeans(is.na(mrg.sub))
+```
+```{r}
+# elimino las variables clinicas con mas de un 10% de NA
+porcentaje <- .1
+columnas_a_borrar <- which(colMeans(is.na(mrg.sub))>porcentaje)
+mrg.sub[,columnas_a_borrar] <- NULL
+```
+```{r}
+#eliminar<- select(mrg.sub,starts_with("clin:X_GENOMIC_ID_"))
+mrg.sub<- select(mrg.sub, -c(3,9, 38, 42:58))# elimino otras variables de identificación del paciente 
+
+#save
+write_csv(mrg.sub, "./VAEdata/mrg_sub.csv")
+```
+```{r}
+# elimino la variable donde indica si el pciente sobrevive o no.
+allData<- select(mrg.sub, -c("clin:vital_status"))
+#save
+write_csv(allData, "./VAEdata/allData.csv")
+```
+```{r}
+omicsData<-select(allData,starts_with(c("Sample","gene:","meth","mirna")))
+#colnames(df) <- gsub(" ","",colnames(df))
+colnames(omicsData) <- gsub(" ","",colnames(omicsData))
+head(omicsData)
+#save
+write_csv(omicsData, "./VAEdata/omicsData.csv")
+```
+```{r}
+for(split.id in seq(1, 10)) {
+    outdir <- file.path(OUTROOT,"data","splitOmics", split.id)
+    if(!dir.exists(outdir))
+        dir.create(outdir, recursive=TRUE)
+    # make it so that the 1st split is for set.seed(78), which was the one created previously
+    set.seed(78+split.id)
+    train.idx <- createDataPartition(y=y, p=0.7, list=FALSE)
+    train.data <- omicsData[train.idx,]
+    train.lab <- y[train.idx]
+    test.data <- omicsData[-train.idx,]
+    test.lab <- y[-train.idx]
+ 
+    # write labels
+    write.table(train.lab, file=file.path(outdir, "labels_OS_tr.txt"), sep="\t", quote=FALSE, row.names=F, col.names=F)
+    write.table(test.lab, file=file.path(outdir, "labels_OS_ts.txt"),sep="\t", quote=FALSE, row.names=F, col.names=F)
+    
+    write_tsv (train.data, file.path(outdir, "omicsData_train.csv"))
+            
+        
+    write_tsv(test.data,file.path(outdir, "omicsData_test.csv"))
+}
+```
+```{r}
+
+omicsDataOS <- mrg.sub[,-(2:36),drop=FALSE]
+omicsDataOS[3] <- NULL
+
+colnames(omicsDataOS) <- gsub(" ","",colnames(omicsDataOS))
+head(omicsDataOS)
+#save
+write_csv(omicsDataOS, "./VAEdata/omicsDataOS.csv")
+```
